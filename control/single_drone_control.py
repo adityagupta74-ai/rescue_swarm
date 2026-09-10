@@ -37,10 +37,11 @@ Run against a real Pixhawk (once step 4 is solid in sim):
 import argparse
 import asyncio
 import logging
+from datetime import datetime
+from pathlib import Path
 
 from mavsdk import System
 from mavsdk.action import ActionError
-from mavsdk.offboard import OffboardError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("single_drone")
@@ -53,29 +54,96 @@ DEFAULT_WAYPOINT_LAT = 47.397606
 DEFAULT_WAYPOINT_LON = 8.543060
 DEFAULT_WAYPOINT_ALT_M = 10.0
 
+# ADDED: timeouts so the script never hangs forever if SITL / vehicle
+# misbehaves. Values are generous for SITL; tighten once you know real
+# hardware timings. A hang during the 30-min competition window is a dead
+# mission, so every blocking wait must be bounded.
+TIMEOUT_CONNECT_S = 30.0
+TIMEOUT_HEALTH_S = 60.0
+TIMEOUT_TAKEOFF_S = 60.0
+TIMEOUT_GOTO_S = 180.0
+TIMEOUT_LAND_S = 120.0
+
+
+# ADDED: file logging so field failures have a durable record. Terminal
+# scrollback is not enough at the field.
+def _setup_file_logging() -> None:
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    fname = log_dir / f"single_drone_{datetime.now():%Y%m%d_%H%M%S}.log"
+    handler = logging.FileHandler(fname)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logging.getLogger().addHandler(handler)
+    log.info("Logging to %s", fname)
+
 
 async def connect_drone(connection_string: str) -> System:
-    """ARM/TAKEOFF/GOTO all require a connected System first. Blocks until
-    the drone reports connected — this is the thing that hangs forever if
-    SITL isn't running yet or the connection string is wrong, so it logs
-    clearly rather than failing silently.
+    """ARM/TAKEOFF/GOTO all require a connected System first.
+
+    FIX: both waits are now bounded by asyncio.wait_for — previously this
+    hung forever if SITL wasn't running, the connection string was wrong,
+    or GPS never locked. Also now waits for is_armable (EKF / battery /
+    compass pre-arm checks), not just global+home position.
     """
     drone = System()
     log.info("Connecting to drone on %s ...", connection_string)
     await drone.connect(system_address=connection_string)
 
-    async for state in drone.core.connection_state():
-        if state.is_connected:
-            log.info("Drone connected.")
-            break
+    async def _wait_connected():
+        async for state in drone.core.connection_state():
+            if state.is_connected:
+                return
 
-    log.info("Waiting for global position + home position lock (needed for GOTO/RTL)...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            log.info("Position lock OK.")
-            break
+    try:
+        await asyncio.wait_for(_wait_connected(), timeout=TIMEOUT_CONNECT_S)
+        log.info("Drone connected.")
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Timed out after {TIMEOUT_CONNECT_S}s waiting for connection. "
+            "Is SITL running? Is the connection string correct?"
+        )
 
+    log.info("Waiting for pre-arm health checks (global pos, home pos, is_armable)...")
+
+    async def _wait_health():
+        async for health in drone.telemetry.health():
+            if (health.is_armable
+                    and health.is_global_position_ok
+                    and health.is_home_position_ok):
+                return health
+
+    try:
+        health = await asyncio.wait_for(_wait_health(), timeout=TIMEOUT_HEALTH_S)
+    except asyncio.TimeoutError:
+        # Print the individual flags so the user knows which check is blocking.
+        async for h in drone.telemetry.health():
+            log.error(
+                "Health timeout — is_armable=%s global_pos_ok=%s home_pos_ok=%s "
+                "gyro_ok=%s accel_ok=%s mag_ok=%s local_pos_ok=%s",
+                h.is_armable, h.is_global_position_ok, h.is_home_position_ok,
+                h.is_gyrometer_calibration_ok, h.is_accelerometer_calibration_ok,
+                h.is_magnetometer_calibration_ok, h.is_local_position_ok,
+            )
+            break
+        raise RuntimeError(f"Timed out after {TIMEOUT_HEALTH_S}s waiting for pre-arm health.")
+
+    log.info("Pre-arm health OK.")
     return drone
+
+
+# ADDED: fetch home altitude once. Needed because MAVSDK's goto_location
+# takes AMSL altitude, not relative-to-home. See goto_waypoint for why.
+async def get_home_altitude(drone: System) -> float:
+    async def _wait_home():
+        async for home in drone.telemetry.home():
+            return home.absolute_altitude_m
+
+    try:
+        home_alt = await asyncio.wait_for(_wait_home(), timeout=TIMEOUT_HEALTH_S)
+        log.info("Home altitude (AMSL): %.2f m", home_alt)
+        return home_alt
+    except asyncio.TimeoutError:
+        raise RuntimeError("Timed out waiting for home altitude.")
 
 
 async def monitor_telemetry(drone: System):
@@ -86,10 +154,13 @@ async def monitor_telemetry(drone: System):
     async def watch_position():
         async for position in drone.telemetry.position():
             # -> protocol.md: gps { lat, lon, alt }
+            # NOTE: absolute_altitude_m is AMSL (what goto_location wants);
+            # relative_altitude_m is altitude above home (what takeoff uses).
+            # Printing both makes the AMSL-vs-relative distinction obvious.
             log.info(
-                "TELEMETRY gps: lat=%.7f lon=%.7f alt=%.2fm",
+                "TELEMETRY gps: lat=%.7f lon=%.7f alt_rel=%.2fm alt_amsl=%.2fm",
                 position.latitude_deg, position.longitude_deg,
-                position.relative_altitude_m,
+                position.relative_altitude_m, position.absolute_altitude_m,
             )
 
     async def watch_battery():
@@ -134,33 +205,61 @@ async def arm_and_takeoff(drone: System, altitude_m: float):
         raise
 
     log.info("TAKEOFF altitude=%.1fm", altitude_m)
+    # NOTE: set_takeoff_altitude IS relative to ground — correct as-is.
     await drone.action.set_takeoff_altitude(altitude_m)
     await drone.action.takeoff()
 
-    # Wait until we've actually reached (roughly) takeoff altitude before
-    # sending the next command — sending GOTO too early is a common
-    # source of flaky single-drone scripts.
-    async for position in drone.telemetry.position():
-        if position.relative_altitude_m >= altitude_m * 0.9:
-            log.info("Reached takeoff altitude.")
-            break
+    # FIX: bounded wait. Previously hung forever if takeoff silently failed.
+    async def _wait_altitude():
+        async for position in drone.telemetry.position():
+            if position.relative_altitude_m >= altitude_m * 0.9:
+                return
 
-
-async def goto_waypoint(drone: System, lat: float, lon: float, alt_m: float):
-    """Maps to protocol.md command: GOTO { lat, lon, alt }."""
-    log.info("GOTO lat=%.7f lon=%.7f alt=%.1fm", lat, lon, alt_m)
-    await drone.action.goto_location(lat, lon, alt_m, yaw_deg=0)
-
-    # Poll until close to the target — a simple distance check, not a
-    # precision approach controller. Good enough for step 4; revisit if
-    # the coverage algorithm (planning/) needs tighter waypoint tolerance.
-    async for position in drone.telemetry.position():
-        dist_m = _rough_distance_m(
-            position.latitude_deg, position.longitude_deg, lat, lon
+    try:
+        await asyncio.wait_for(_wait_altitude(), timeout=TIMEOUT_TAKEOFF_S)
+        log.info("Reached takeoff altitude.")
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Timed out after {TIMEOUT_TAKEOFF_S}s waiting for takeoff altitude."
         )
-        if dist_m < 2.0:
-            log.info("Reached waypoint (within %.1fm).", dist_m)
-            break
+
+
+# FIX: signature now takes home_alt_amsl. MAVSDK's goto_location expects
+# ABSOLUTE (AMSL) altitude, not relative-to-home. Passing the relative
+# value (10 m) against a home at ~500 m AMSL commands the drone to descend
+# to ~10 m AMSL — i.e. into the ground. This was the critical bug.
+async def goto_waypoint(drone: System, lat: float, lon: float, alt_m: float,
+                        home_alt_amsl: float, yaw_deg: float = 0.0):
+    """Maps to protocol.md command: GOTO { lat, lon, alt }.
+
+    `alt_m` is relative-to-home (matches protocol.md). We convert to AMSL
+    internally before calling MAVSDK.
+    """
+    target_amsl = home_alt_amsl + alt_m
+    log.info(
+        "GOTO lat=%.7f lon=%.7f alt_rel=%.1fm (alt_amsl=%.1fm) yaw=%.1f",
+        lat, lon, alt_m, target_amsl, yaw_deg,
+    )
+    await drone.action.goto_location(lat, lon, target_amsl, yaw_deg)
+
+    # FIX: bounded wait. Poll until close to target — a simple distance
+    # check, not a precision approach controller.
+    async def _wait_arrival():
+        async for position in drone.telemetry.position():
+            dist_m = _rough_distance_m(
+                position.latitude_deg, position.longitude_deg, lat, lon
+            )
+            if dist_m < 2.0:
+                return dist_m
+
+    try:
+        dist_m = await asyncio.wait_for(_wait_arrival(), timeout=TIMEOUT_GOTO_S)
+        log.info("Reached waypoint (within %.1fm).", dist_m)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Timed out after {TIMEOUT_GOTO_S}s flying to waypoint "
+            f"({lat:.7f}, {lon:.7f}, rel {alt_m}m)."
+        )
 
 
 async def hold_position(seconds: float):
@@ -182,10 +281,19 @@ async def return_and_land(drone: System):
         log.error("RTL failed: %s", e)
         raise
 
-    async for armed in drone.telemetry.armed():
-        if not armed:
-            log.info("Landed and disarmed.")
-            break
+    # FIX: bounded wait for disarm (i.e. landed).
+    async def _wait_disarmed():
+        async for armed in drone.telemetry.armed():
+            if not armed:
+                return
+
+    try:
+        await asyncio.wait_for(_wait_disarmed(), timeout=TIMEOUT_LAND_S)
+        log.info("Landed and disarmed.")
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Timed out after {TIMEOUT_LAND_S}s waiting for landing/disarm."
+        )
 
 
 def _rough_distance_m(lat1, lon1, lat2, lon2) -> float:
@@ -200,18 +308,37 @@ def _rough_distance_m(lat1, lon1, lat2, lon2) -> float:
 
 
 async def run_single_drone_mission(connection_string: str, altitude_m: float,
-                                    wp_lat: float, wp_lon: float, wp_alt_m: float):
+                                    wp_lat: float, wp_lon: float, wp_alt_m: float,
+                                    yaw_deg: float):
     drone = await connect_drone(connection_string)
+    home_alt_amsl = await get_home_altitude(drone)
 
     telemetry_task = asyncio.create_task(monitor_telemetry(drone))
 
+    mission_completed = False
     try:
         await arm_and_takeoff(drone, altitude_m)
-        await goto_waypoint(drone, wp_lat, wp_lon, wp_alt_m)
+        await goto_waypoint(drone, wp_lat, wp_lon, wp_alt_m, home_alt_amsl, yaw_deg)
         await hold_position(5.0)
         await return_and_land(drone)
+        mission_completed = True
     finally:
+        # ADDED: safety net. Previously, any exception after takeoff left
+        # the drone armed and airborne with nothing to bring it home.
+        if not mission_completed:
+            log.warning("Mission did not complete — issuing safety RTL.")
+            try:
+                await drone.action.return_to_launch()
+            except Exception as e:
+                log.error("Safety RTL failed: %s", e)
+
+        # FIX: cancel *and* await the telemetry task, and swallow its
+        # CancelledError so it doesn't propagate during shutdown.
         telemetry_task.cancel()
+        try:
+            await telemetry_task
+        except asyncio.CancelledError:
+            pass
 
 
 def main():
@@ -226,10 +353,16 @@ def main():
     parser.add_argument("--wp-lat", type=float, default=DEFAULT_WAYPOINT_LAT)
     parser.add_argument("--wp-lon", type=float, default=DEFAULT_WAYPOINT_LON)
     parser.add_argument("--wp-alt", type=float, default=DEFAULT_WAYPOINT_ALT_M)
+    # ADDED: yaw control, needed once survey patterns land in planning/.
+    parser.add_argument("--yaw", type=float, default=0.0,
+                        help="Yaw at waypoint in degrees (0 = north).")
     args = parser.parse_args()
 
+    _setup_file_logging()
+
     asyncio.run(run_single_drone_mission(
-        args.connection, args.altitude, args.wp_lat, args.wp_lon, args.wp_alt
+        args.connection, args.altitude,
+        args.wp_lat, args.wp_lon, args.wp_alt, args.yaw,
     ))
 
 
