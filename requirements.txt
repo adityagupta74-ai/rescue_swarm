@@ -1,0 +1,16 @@
+# Drone control
+mavsdk
+pymavlink
+
+# Computer vision
+ultralytics
+opencv-python
+
+# Dashboard / networking
+fastapi
+uvicorn
+websockets
+
+# General
+numpy
+pyyaml
