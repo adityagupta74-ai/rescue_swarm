@@ -4,6 +4,16 @@ Centralized 4-drone search-and-rescue swarm. Pixhawk 2.4.8 + Raspberry Pi 5 per
 drone, Python coordination algorithm running on the base station, star
 topology (base ↔ each drone; drones never talk to each other).
 
+## Hard constraints (rulebook v2.1)
+- **25 kg combined all-up weight for all 4 drones together** (batteries,
+  payloads, sensors, comms — everything). Not per-drone. Check this
+  against actual hardware once finalized.
+- 30-minute mission timer, 5-minute setup, 12ft x 12ft launch/land pad.
+- Manual intervention (waypoint edits, path correction, payload
+  commands, survivor tagging, replanning) is a scored penalty
+  (-50/instance) — ELRS RC override should be reserved for genuine
+  emergency recall/abort only. See `docs/mission_spec.md` for full detail.
+
 ## Comms stack
 - **Video + primary telemetry/commands:** WiFi network (router + antenna, base station side)
 - **Backup telemetry:** 433MHz SiK-style radio, one pair per drone, distinct NetID per pair
