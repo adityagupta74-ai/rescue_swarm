@@ -14,3 +14,6 @@ websockets
 # General
 numpy
 pyyaml
+
+# Coverage plotting
+matplotlib

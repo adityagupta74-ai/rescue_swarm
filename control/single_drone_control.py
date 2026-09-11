@@ -8,29 +8,22 @@ Scope of this file, on purpose:
     connect -> arm -> takeoff -> fly to one GPS waypoint -> hold -> RTL -> land
     + continuous telemetry read-back the whole time.
 
-This is NOT the swarm coordinator. Multi-drone logic (sector assignment,
+This is NOT the swarm coordinator. Multi-drone logic (segment assignment,
 running 4 of these at once, battery-triggered auto-RTL across the fleet)
-belongs in control/multi_drone_control.py later (roadmap step 6) — don't
-grow this file into that. Keep this one boring and reliable; every bug
-fixed here would otherwise get multiplied by 4 later.
+belongs in control/multi_drone_control.py later.
 
 Commands used below map directly to docs/protocol.md's command table:
     ARM, TAKEOFF, GOTO, HOLD, RTL
-Telemetry fields printed below map to docs/protocol.md's telemetry table.
-Fields that only make sense at the swarm level (assigned_task, kit_status,
-rc_override_active) are noted but not implemented here — they belong in
-the multi-drone version once there's an actual base-station process to
-send/receive them.
 
 Requires: mavsdk (see requirements.txt)
 
 Run against ArduPilot SITL:
     1. Start SITL in a separate terminal:
-         sim_vehicle.py -v ArduCopter --out=udp:127.0.0.1:14540
+         sim_vehicle.py -v ArduCopter --out=udp:127.0.0.1:14540 --console --map
     2. Run this script:
          python control/single_drone_control.py
 
-Run against a real Pixhawk (once step 4 is solid in sim):
+Run against a real Pixhawk (later):
     python control/single_drone_control.py --connection serial:///dev/ttyACM0:57600
 """
 
@@ -46,18 +39,14 @@ from mavsdk.action import ActionError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("single_drone")
 
-# Default target altitude for takeoff and the test waypoint (meters, relative to home)
 DEFAULT_TAKEOFF_ALT_M = 10.0
-# Default test waypoint offset — replace with a real field waypoint once
-# docs/mission_spec.md has actual venue GPS bounds instead of TODO (venue)
-DEFAULT_WAYPOINT_LAT = 47.397606
-DEFAULT_WAYPOINT_LON = 8.543060
+# Default test waypoint — SITL's home is in Canberra (-35.3632620, 149.1652373).
+# This waypoint is ~80 m northeast of home, reachable in a few seconds.
+# Replace with real field waypoints once docs/mission_spec.md has venue GPS bounds.
+DEFAULT_WAYPOINT_LAT = -35.362500
+DEFAULT_WAYPOINT_LON = 149.165800
 DEFAULT_WAYPOINT_ALT_M = 10.0
 
-# ADDED: timeouts so the script never hangs forever if SITL / vehicle
-# misbehaves. Values are generous for SITL; tighten once you know real
-# hardware timings. A hang during the 30-min competition window is a dead
-# mission, so every blocking wait must be bounded.
 TIMEOUT_CONNECT_S = 30.0
 TIMEOUT_HEALTH_S = 60.0
 TIMEOUT_TAKEOFF_S = 60.0
@@ -65,8 +54,6 @@ TIMEOUT_GOTO_S = 180.0
 TIMEOUT_LAND_S = 120.0
 
 
-# ADDED: file logging so field failures have a durable record. Terminal
-# scrollback is not enough at the field.
 def _setup_file_logging() -> None:
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -78,13 +65,6 @@ def _setup_file_logging() -> None:
 
 
 async def connect_drone(connection_string: str) -> System:
-    """ARM/TAKEOFF/GOTO all require a connected System first.
-
-    FIX: both waits are now bounded by asyncio.wait_for — previously this
-    hung forever if SITL wasn't running, the connection string was wrong,
-    or GPS never locked. Also now waits for is_armable (EKF / battery /
-    compass pre-arm checks), not just global+home position.
-    """
     drone = System()
     log.info("Connecting to drone on %s ...", connection_string)
     await drone.connect(system_address=connection_string)
@@ -113,9 +93,8 @@ async def connect_drone(connection_string: str) -> System:
                 return health
 
     try:
-        health = await asyncio.wait_for(_wait_health(), timeout=TIMEOUT_HEALTH_S)
+        await asyncio.wait_for(_wait_health(), timeout=TIMEOUT_HEALTH_S)
     except asyncio.TimeoutError:
-        # Print the individual flags so the user knows which check is blocking.
         async for h in drone.telemetry.health():
             log.error(
                 "Health timeout — is_armable=%s global_pos_ok=%s home_pos_ok=%s "
@@ -131,32 +110,27 @@ async def connect_drone(connection_string: str) -> System:
     return drone
 
 
-# ADDED: fetch home altitude once. Needed because MAVSDK's goto_location
-# takes AMSL altitude, not relative-to-home. See goto_waypoint for why.
 async def get_home_altitude(drone: System) -> float:
-    async def _wait_home():
-        async for home in drone.telemetry.home():
-            return home.absolute_altitude_m
+    """Read the drone's current AMSL altitude BEFORE takeoff. Since the
+    drone is on the ground at this point, its AMSL altitude is effectively
+    home altitude. This is more reliable than telemetry.home(), which
+    ArduPilot does not publish until after the first arm.
+    """
+    async def _wait_position():
+        async for position in drone.telemetry.position():
+            return position.absolute_altitude_m
 
     try:
-        home_alt = await asyncio.wait_for(_wait_home(), timeout=TIMEOUT_HEALTH_S)
-        log.info("Home altitude (AMSL): %.2f m", home_alt)
+        home_alt = await asyncio.wait_for(_wait_position(), timeout=TIMEOUT_HEALTH_S)
+        log.info("Home altitude (AMSL, from position): %.2f m", home_alt)
         return home_alt
     except asyncio.TimeoutError:
-        raise RuntimeError("Timed out waiting for home altitude.")
+        raise RuntimeError("Timed out waiting for initial position fix.")
 
 
 async def monitor_telemetry(drone: System):
-    """Continuous telemetry read-back — runs concurrently with the mission
-    steps below via asyncio.create_task(). Field names/comments map to
-    docs/protocol.md's telemetry table.
-    """
     async def watch_position():
         async for position in drone.telemetry.position():
-            # -> protocol.md: gps { lat, lon, alt }
-            # NOTE: absolute_altitude_m is AMSL (what goto_location wants);
-            # relative_altitude_m is altitude above home (what takeoff uses).
-            # Printing both makes the AMSL-vs-relative distinction obvious.
             log.info(
                 "TELEMETRY gps: lat=%.7f lon=%.7f alt_rel=%.2fm alt_amsl=%.2fm",
                 position.latitude_deg, position.longitude_deg,
@@ -164,28 +138,19 @@ async def monitor_telemetry(drone: System):
             )
 
     async def watch_battery():
+        # NOTE: In MAVSDK 3.x, remaining_percent is already 0-100, not 0-1.
         async for battery in drone.telemetry.battery():
-            # -> protocol.md: battery_pct
-            log.info("TELEMETRY battery_pct: %.0f%%", battery.remaining_percent * 100)
+            log.info("TELEMETRY battery_pct: %.0f%%", battery.remaining_percent)
 
     async def watch_flight_mode():
+        # NOTE: MAVSDK maps ArduPilot's GUIDED mode to FlightMode.OFFBOARD
+        # in its abstract enum. Don't compare against FlightMode.GUIDED.
         async for mode in drone.telemetry.flight_mode():
-            # -> protocol.md: mode
             log.info("TELEMETRY mode: %s", mode)
 
     async def watch_armed():
         async for armed in drone.telemetry.armed():
-            # -> protocol.md: state (approximated here; full state machine
-            # from protocol.md — IDLE/ARMING/TAKEOFF/SEARCHING/etc. — is a
-            # multi-drone-version concern once there's mission logic to
-            # drive those transitions)
             log.info("TELEMETRY armed: %s", armed)
-
-    # NOTE: rc_override_active, health (full struct), assigned_task, and
-    # kit_status from protocol.md are not populated here on purpose —
-    # they either need swarm-level context (assigned_task, kit_status)
-    # or RC-override detection wiring (rc_override_active) that belongs
-    # in the multi-drone version, not this single-drone baseline.
 
     await asyncio.gather(
         watch_position(),
@@ -196,7 +161,10 @@ async def monitor_telemetry(drone: System):
 
 
 async def arm_and_takeoff(drone: System, altitude_m: float):
-    """Maps to protocol.md commands: ARM, then TAKEOFF { altitude }."""
+    """ARM then TAKEOFF. MAVSDK's action.takeoff() internally switches the
+    autopilot to GUIDED (or the vehicle-specific equivalent) before issuing
+    MAV_CMD_NAV_TAKEOFF, so we don't need to set the mode explicitly.
+    """
     log.info("ARM")
     try:
         await drone.action.arm()
@@ -205,11 +173,13 @@ async def arm_and_takeoff(drone: System, altitude_m: float):
         raise
 
     log.info("TAKEOFF altitude=%.1fm", altitude_m)
-    # NOTE: set_takeoff_altitude IS relative to ground — correct as-is.
     await drone.action.set_takeoff_altitude(altitude_m)
-    await drone.action.takeoff()
+    try:
+        await drone.action.takeoff()
+    except ActionError as e:
+        log.error("Takeoff failed: %s", e)
+        raise
 
-    # FIX: bounded wait. Previously hung forever if takeoff silently failed.
     async def _wait_altitude():
         async for position in drone.telemetry.position():
             if position.relative_altitude_m >= altitude_m * 0.9:
@@ -224,17 +194,8 @@ async def arm_and_takeoff(drone: System, altitude_m: float):
         )
 
 
-# FIX: signature now takes home_alt_amsl. MAVSDK's goto_location expects
-# ABSOLUTE (AMSL) altitude, not relative-to-home. Passing the relative
-# value (10 m) against a home at ~500 m AMSL commands the drone to descend
-# to ~10 m AMSL — i.e. into the ground. This was the critical bug.
 async def goto_waypoint(drone: System, lat: float, lon: float, alt_m: float,
                         home_alt_amsl: float, yaw_deg: float = 0.0):
-    """Maps to protocol.md command: GOTO { lat, lon, alt }.
-
-    `alt_m` is relative-to-home (matches protocol.md). We convert to AMSL
-    internally before calling MAVSDK.
-    """
     target_amsl = home_alt_amsl + alt_m
     log.info(
         "GOTO lat=%.7f lon=%.7f alt_rel=%.1fm (alt_amsl=%.1fm) yaw=%.1f",
@@ -242,8 +203,6 @@ async def goto_waypoint(drone: System, lat: float, lon: float, alt_m: float,
     )
     await drone.action.goto_location(lat, lon, target_amsl, yaw_deg)
 
-    # FIX: bounded wait. Poll until close to target — a simple distance
-    # check, not a precision approach controller.
     async def _wait_arrival():
         async for position in drone.telemetry.position():
             dist_m = _rough_distance_m(
@@ -263,17 +222,11 @@ async def goto_waypoint(drone: System, lat: float, lon: float, alt_m: float,
 
 
 async def hold_position(seconds: float):
-    """Maps to protocol.md command: HOLD. On the real vehicle this is just
-    "stop sending new setpoints" — goto_location already leaves the drone
-    loitering at the target, so this is a deliberate pause in the script,
-    not an extra MAVSDK call.
-    """
     log.info("HOLD for %.1fs", seconds)
     await asyncio.sleep(seconds)
 
 
 async def return_and_land(drone: System):
-    """Maps to protocol.md command: RTL."""
     log.info("RTL")
     try:
         await drone.action.return_to_launch()
@@ -281,7 +234,6 @@ async def return_and_land(drone: System):
         log.error("RTL failed: %s", e)
         raise
 
-    # FIX: bounded wait for disarm (i.e. landed).
     async def _wait_disarmed():
         async for armed in drone.telemetry.armed():
             if not armed:
@@ -297,10 +249,6 @@ async def return_and_land(drone: System):
 
 
 def _rough_distance_m(lat1, lon1, lat2, lon2) -> float:
-    """Flat-earth approximation, fine at the scale of a single waypoint
-    check. Do not reuse this for field-scale coverage-area math in
-    planning/ — use a proper geodesic calc there.
-    """
     import math
     dlat = (lat2 - lat1) * 111_320
     dlon = (lon2 - lon1) * 111_320 * math.cos(math.radians(lat1))
@@ -323,8 +271,6 @@ async def run_single_drone_mission(connection_string: str, altitude_m: float,
         await return_and_land(drone)
         mission_completed = True
     finally:
-        # ADDED: safety net. Previously, any exception after takeoff left
-        # the drone armed and airborne with nothing to bring it home.
         if not mission_completed:
             log.warning("Mission did not complete — issuing safety RTL.")
             try:
@@ -332,8 +278,6 @@ async def run_single_drone_mission(connection_string: str, altitude_m: float,
             except Exception as e:
                 log.error("Safety RTL failed: %s", e)
 
-        # FIX: cancel *and* await the telemetry task, and swallow its
-        # CancelledError so it doesn't propagate during shutdown.
         telemetry_task.cancel()
         try:
             await telemetry_task
@@ -342,18 +286,15 @@ async def run_single_drone_mission(connection_string: str, altitude_m: float,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Single-drone control test (roadmap step 4)")
+    parser = argparse.ArgumentParser(description="Single-drone control test")
     parser.add_argument(
         "--connection", default="udp://:14540",
-        help="MAVSDK connection string. Default matches ArduPilot SITL "
-             "(sim_vehicle.py --out=udp:127.0.0.1:14540). Use "
-             "serial:///dev/ttyACM0:57600 for a real Pixhawk.",
+        help="MAVSDK connection string. Default matches ArduPilot SITL.",
     )
     parser.add_argument("--altitude", type=float, default=DEFAULT_TAKEOFF_ALT_M)
     parser.add_argument("--wp-lat", type=float, default=DEFAULT_WAYPOINT_LAT)
     parser.add_argument("--wp-lon", type=float, default=DEFAULT_WAYPOINT_LON)
     parser.add_argument("--wp-alt", type=float, default=DEFAULT_WAYPOINT_ALT_M)
-    # ADDED: yaw control, needed once survey patterns land in planning/.
     parser.add_argument("--yaw", type=float, default=0.0,
                         help="Yaw at waypoint in degrees (0 = north).")
     args = parser.parse_args()
